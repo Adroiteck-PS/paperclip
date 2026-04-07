@@ -1,0 +1,102 @@
+# Adroiteck CI/CD Pipeline for Atalaya (Paperclip) deployment
+# Uses central-workflow reusable workflows for security scanning and build/push.
+# Deploys to OKD namespace "atalaya" via ArgoCD GitOps.
+#
+# This workflow coexists with the upstream paperclip workflows (docker.yml, pr.yml, etc.)
+# and is specific to the Adroiteck OKD deployment.
+
+name: "CI/CD: Atalaya"
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - 'server/**'
+      - 'ui/**'
+      - 'packages/**'
+      - 'cli/**'
+      - 'skills/**'
+      - 'package.json'
+      - 'pnpm-lock.yaml'
+      - 'Dockerfile.okd'
+      - '.github/workflows/ci-adroiteck.yml'
+  pull_request:
+    branches: [master]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ── Step 1: Security Scan ──────────────────────────────────────────────────
+  security:
+    uses: Adroiteck-PS/central-workflow/.github/workflows/_security-scan.yml@main
+    with:
+      manifest-path: '.'
+      scan-secrets: true
+      scan-dependencies: true
+      fail-on-warnings: false
+    secrets: inherit
+
+  # ── Step 2: Snyk Scan ──────────────────────────────────────────────────────
+  snyk:
+    uses: Adroiteck-PS/central-workflow/.github/workflows/_snyk-scan.yml@main
+    with:
+      scan-deps: true
+      scan-code: true
+      scan-iac: true
+      scan-container: false
+      severity-threshold: high
+    secrets: inherit
+
+  # ── Step 3: Build + Push Container Image ───────────────────────────────────
+  # Pushes to ghcr.io/adroiteck-ps/atalaya using the OKD-compatible Dockerfile
+  build:
+    if: github.ref == 'refs/heads/master' && github.event_name == 'push'
+    needs: [security, snyk]
+    uses: Adroiteck-PS/central-workflow/.github/workflows/_build-push-ghcr.yml@main
+    with:
+      image-name: 'atalaya'
+      dockerfile: 'Dockerfile.okd'
+      context: '.'
+      platforms: 'linux/amd64'
+    secrets: inherit
+
+  # ── Step 3b: Snyk Container Scan (post-build) ─────────────────────────────
+  snyk-container:
+    if: github.ref == 'refs/heads/master' && github.event_name == 'push'
+    needs: [build]
+    uses: Adroiteck-PS/central-workflow/.github/workflows/_snyk-scan.yml@main
+    with:
+      scan-deps: false
+      scan-code: false
+      scan-iac: false
+      scan-container: true
+      image-name: 'ghcr.io/adroiteck-ps/atalaya:${{ needs.build.outputs.image-tag }}'
+      severity-threshold: high
+    secrets: inherit
+
+  # ── Step 4: Deploy Gate ────────────────────────────────────────────────────
+  deploy-gate:
+    if: github.ref == 'refs/heads/master' && github.event_name == 'push'
+    needs: [build]
+    uses: Adroiteck-PS/central-workflow/.github/workflows/_deploy-gate.yml@main
+    with:
+      app-name: 'atalaya'
+      namespace: 'atalaya'
+      manifest-path: '.'
+      require-health-endpoint: true
+      require-otel: true
+    secrets: inherit
+
+  # ── Step 5: Update GitOps ──────────────────────────────────────────────────
+  # Updates image tag in app-atalaya-config → triggers ArgoCD sync
+  deploy:
+    if: github.ref == 'refs/heads/master' && github.event_name == 'push'
+    needs: [build, deploy-gate, snyk-container]
+    uses: Adroiteck-PS/central-workflow/.github/workflows/_update-gitops.yml@main
+    with:
+      app-name: 'atalaya'
+      image-tag: '${{ needs.build.outputs.image-tag }}'
+      environment: 'prod'
+    secrets: inherit
