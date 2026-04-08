@@ -58,7 +58,7 @@ FROM base AS production
 WORKDIR /app
 COPY --from=build /app /app
 
-RUN npm install --global --omit=dev @anthropic-ai/claude-code@latest @openai/codex@latest opencode-ai \
+RUN npm install --global --omit=dev @anthropic-ai/claude-code@latest @openai/codex@latest opencode-ai @google/gemini-cli@latest \
   && mkdir -p /paperclip \
   && chmod 775 /paperclip \
   && chown 1001:0 /paperclip
