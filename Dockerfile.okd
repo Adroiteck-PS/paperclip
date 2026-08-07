@@ -1,45 +1,90 @@
-# OKD-compatible Dockerfile for Paperclip (Atalaya deployment)
-# Differences from upstream Dockerfile:
-#   - No gosu (runs as non-root UID 1001 directly)
-#   - Compatible with OKD restricted-v2 SCC
-#   - OKD assigns arbitrary UID at runtime; /paperclip must be group-writable
+# OKD/OpenShift-compatible Dockerfile for Paperclip (Atalaya deployment)
 #
-# Build: docker build -f Dockerfile.okd -t atalaya .
+# REBUILT 2026-08-07 from upstream Dockerfile @ v2026.722.0. The previous
+# version was derived from the Apr-2026 tree and its per-package COPY list had
+# drifted by 25 workspace packages, which would have failed
+# `pnpm install --frozen-lockfile` outright.
+#
+# Differences from upstream Dockerfile — keep this list current:
+#   1. No gosu / usermod / groupmod. OKD's restricted-v2 SCC assigns an
+#      arbitrary UID in the namespace range, so remapping a fixed `node` user
+#      is pointless and the usermod calls fail.
+#   2. No docker-entrypoint.sh. Upstream's entrypoint exists to gosu-switch
+#      users; unprivileged it just warns and execs. We skip it entirely.
+#   3. /paperclip is group-writable and owned by GID 0, because the arbitrary
+#      runtime UID is always a member of the root group under restricted-v2.
+#   4. No `COPY --parents` (BuildKit >=1.7 only). Every workspace package.json
+#      is copied explicitly so this builds under docker, podman, buildah, and
+#      OpenShift BuildConfig alike.
+#   5. openssh-client + jq installed in `base` (upstream adds them only in the
+#      production stage) so build-stage tooling can use them too.
+#
+# NOTE: upstream now installs `gh` directly from Debian trixie repos, so the
+# old GitHub-CLI keyring + sha256 pin workaround is GONE. That checksum broke
+# every time GitHub rotated the key; do not reintroduce it.
+#
+# Build (in-cluster, preferred — avoids pushing 2.9GB over the site uplink):
+#   oc start-build paperclip --from-dir=. --follow -n paperclip
+# Build (local, needs docker/podman):
+#   docker build -f Dockerfile.okd -t paperclip:v2026.722.0 .
 
 FROM node:lts-trixie-slim AS base
 RUN apt-get update \
-  && apt-get install -y --no-install-recommends ca-certificates curl git wget ripgrep python3 openssh-client jq \
-  && mkdir -p -m 755 /etc/apt/keyrings \
-  && wget -nv -O/etc/apt/keyrings/githubcli-archive-keyring.gpg https://cli.github.com/packages/githubcli-archive-keyring.gpg \
-  && echo "6084d5d7bd8e288441e0e94fc6275570895da18e6751f70f057485dc2d1a811b  /etc/apt/keyrings/githubcli-archive-keyring.gpg" | sha256sum -c - \
-  && chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg \
-  && mkdir -p -m 755 /etc/apt/sources.list.d \
-  && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" > /etc/apt/sources.list.d/github-cli.list \
-  && apt-get update \
-  && apt-get install -y --no-install-recommends gh \
+  && apt-get install -y --no-install-recommends \
+       ca-certificates curl gh git wget ripgrep python3 openssh-client jq \
   && rm -rf /var/lib/apt/lists/* \
   && corepack enable
 
 # ── Dependency install ────────────────────────────────────────────────────────
+# Every workspace member listed in pnpm-workspace.yaml is copied before the
+# install so the layer caches on manifest changes only. sandbox-providers and
+# plugin-orchestration-smoke-example are excluded from the workspace globs but
+# are copied anyway — harmless, and it keeps this list mechanically derivable
+# from `git ls-tree`, so regenerating it after an upstream bump is trivial.
 FROM base AS deps
 WORKDIR /app
 COPY package.json pnpm-workspace.yaml pnpm-lock.yaml .npmrc ./
 COPY cli/package.json cli/
 COPY server/package.json server/
 COPY ui/package.json ui/
-COPY packages/shared/package.json packages/shared/
-COPY packages/db/package.json packages/db/
 COPY packages/adapter-utils/package.json packages/adapter-utils/
+COPY packages/db/package.json packages/db/
+COPY packages/google-sheets-mcp-server/package.json packages/google-sheets-mcp-server/
+COPY packages/kv-demo-mcp-server/package.json packages/kv-demo-mcp-server/
 COPY packages/mcp-server/package.json packages/mcp-server/
+COPY packages/shared/package.json packages/shared/
+COPY packages/skills-catalog/package.json packages/skills-catalog/
+COPY packages/teams-catalog/package.json packages/teams-catalog/
 COPY packages/adapters/claude-local/package.json packages/adapters/claude-local/
 COPY packages/adapters/codex-local/package.json packages/adapters/codex-local/
+COPY packages/adapters/cursor-cloud/package.json packages/adapters/cursor-cloud/
 COPY packages/adapters/cursor-local/package.json packages/adapters/cursor-local/
 COPY packages/adapters/gemini-local/package.json packages/adapters/gemini-local/
+COPY packages/adapters/grok-local/package.json packages/adapters/grok-local/
+COPY packages/adapters/hermes/package.json packages/adapters/hermes/
+COPY packages/adapters/hermes-gateway/package.json packages/adapters/hermes-gateway/
 COPY packages/adapters/openclaw-gateway/package.json packages/adapters/openclaw-gateway/
 COPY packages/adapters/opencode-local/package.json packages/adapters/opencode-local/
 COPY packages/adapters/pi-local/package.json packages/adapters/pi-local/
 COPY packages/plugins/sdk/package.json packages/plugins/sdk/
+COPY packages/plugins/create-paperclip-plugin/package.json packages/plugins/create-paperclip-plugin/
+COPY packages/plugins/paperclip-plugin-fake-sandbox/package.json packages/plugins/paperclip-plugin-fake-sandbox/
+COPY packages/plugins/plugin-llm-wiki/package.json packages/plugins/plugin-llm-wiki/
+COPY packages/plugins/plugin-workspace-diff/package.json packages/plugins/plugin-workspace-diff/
+COPY packages/plugins/examples/plugin-authoring-smoke-example/package.json packages/plugins/examples/plugin-authoring-smoke-example/
+COPY packages/plugins/examples/plugin-file-browser-example/package.json packages/plugins/examples/plugin-file-browser-example/
+COPY packages/plugins/examples/plugin-hello-world-example/package.json packages/plugins/examples/plugin-hello-world-example/
+COPY packages/plugins/examples/plugin-kitchen-sink-example/package.json packages/plugins/examples/plugin-kitchen-sink-example/
+COPY packages/plugins/examples/plugin-orchestration-smoke-example/package.json packages/plugins/examples/plugin-orchestration-smoke-example/
+COPY packages/plugins/sandbox-providers/cloudflare/package.json packages/plugins/sandbox-providers/cloudflare/
+COPY packages/plugins/sandbox-providers/daytona/package.json packages/plugins/sandbox-providers/daytona/
+COPY packages/plugins/sandbox-providers/e2b/package.json packages/plugins/sandbox-providers/e2b/
+COPY packages/plugins/sandbox-providers/exe-dev/package.json packages/plugins/sandbox-providers/exe-dev/
+COPY packages/plugins/sandbox-providers/kubernetes/package.json packages/plugins/sandbox-providers/kubernetes/
+COPY packages/plugins/sandbox-providers/modal/package.json packages/plugins/sandbox-providers/modal/
+COPY packages/plugins/sandbox-providers/novita/package.json packages/plugins/sandbox-providers/novita/
 COPY patches/ patches/
+COPY scripts/link-plugin-dev-sdk.mjs scripts/
 
 RUN pnpm install --frozen-lockfile
 
@@ -48,24 +93,28 @@ FROM base AS build
 WORKDIR /app
 COPY --from=deps /app /app
 COPY . .
-RUN pnpm --filter @paperclipai/ui build \
-  && pnpm --filter @paperclipai/plugin-sdk build \
-  && pnpm --filter @paperclipai/server build \
-  && test -f server/dist/index.js || (echo "ERROR: server build output missing" && exit 1)
+RUN pnpm --filter @paperclipai/ui build
+RUN pnpm --filter @paperclipai/plugin-sdk build
+RUN pnpm --filter @paperclipai/server build
+RUN test -f server/dist/index.js || (echo "ERROR: server build output missing" && exit 1)
 
 # ── Production ────────────────────────────────────────────────────────────────
 FROM base AS production
 WORKDIR /app
 COPY --from=build /app /app
 
-RUN npm install --global --omit=dev @anthropic-ai/claude-code@latest @openai/codex@latest opencode-ai @google/gemini-cli@latest \
+RUN npm install --global --omit=dev \
+      @anthropic-ai/claude-code@latest \
+      @openai/codex@latest \
+      opencode-ai \
+      @google/gemini-cli@latest \
   && mkdir -p /paperclip \
-  && chmod 775 /paperclip \
-  && chown 1001:0 /paperclip
+  && chown 1001:0 /paperclip \
+  && chmod 775 /paperclip
 
-# OKD restricted-v2 SCC: container runs as arbitrary UID in group 0 (root group).
-# All writable paths must be group-writable by GID 0.
-RUN chmod -R g=u /paperclip
+# restricted-v2 SCC: the container runs as an arbitrary UID that is always a
+# member of GID 0. Every path the app writes to must be group-writable.
+RUN chmod -R g=u /paperclip /app
 
 ENV NODE_ENV=production \
   HOME=/paperclip \
@@ -77,13 +126,15 @@ ENV NODE_ENV=production \
   PAPERCLIP_CONFIG=/paperclip/instances/default/config.json \
   PAPERCLIP_DEPLOYMENT_MODE=authenticated \
   PAPERCLIP_DEPLOYMENT_EXPOSURE=private \
-  OPENCODE_ALLOW_ALL_MODELS=true
+  OPENCODE_ALLOW_ALL_MODELS=true \
+  GEMINI_SANDBOX=false
 
 EXPOSE 3100
 
-# Run as non-root. OKD will override this with an arbitrary UID in the
-# namespace's allowed range, but setting USER ensures the image also works
-# outside OKD without root.
+# OKD overrides this with an arbitrary UID from the namespace range; setting it
+# keeps the image runnable as non-root outside OKD too. No ENTRYPOINT: upstream's
+# docker-entrypoint.sh only exists to gosu-switch users, which we cannot and
+# need not do here.
 USER 1001
 
 CMD ["node", "--import", "./server/node_modules/tsx/dist/loader.mjs", "server/dist/index.js"]
