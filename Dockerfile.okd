@@ -1,59 +1,42 @@
 # OKD/OpenShift-compatible Dockerfile for Paperclip (Atalaya deployment)
 #
-# REBUILT 2026-08-07 from upstream Dockerfile @ v2026.722.0. The previous
-# version was derived from the Apr-2026 tree and its per-package COPY list had
-# drifted by 25 workspace packages, which would have failed
-# `pnpm install --frozen-lockfile` outright.
+# Rebuilt from the upstream Dockerfile at v2026.1005.0.
 #
-# Differences from upstream Dockerfile — keep this list current:
-#   1. No gosu / usermod / groupmod. OKD's restricted-v2 SCC assigns an
-#      arbitrary UID in the namespace range, so remapping a fixed `node` user
-#      is pointless and the usermod calls fail.
-#   2. No docker-entrypoint.sh. Upstream's entrypoint exists to gosu-switch
-#      users; unprivileged it just warns and execs. We skip it entirely.
-#   3. /paperclip is group-writable and owned by GID 0, because the arbitrary
-#      runtime UID is always a member of the root group under restricted-v2.
-#   4. No `COPY --parents` (BuildKit >=1.7 only). Every workspace package.json
-#      is copied explicitly so this builds under docker, podman, buildah, and
-#      OpenShift BuildConfig alike.
-#   5. openssh-client + jq installed in `base` (upstream adds them only in the
-#      production stage) so build-stage tooling can use them too.
+# Differences from the upstream Dockerfile:
+#   1. Do not install gosu or remap a fixed user. The restricted-v2 SCC assigns
+#      an arbitrary UID that is a member of GID 0.
+#   2. Do not use docker-entrypoint.sh. It exists to remap and switch users.
+#   3. Make application paths group-writable for the arbitrary runtime UID.
+#   4. Replace COPY --parents with explicit package manifest copies for
+#      compatibility with OpenShift BuildConfig and Buildah.
+#   5. Install openssh-client and jq in the shared base stage.
 #
-# NOTE: upstream now installs `gh` directly from Debian trixie repos, so the
-# old GitHub-CLI keyring + sha256 pin workaround is GONE. That checksum broke
-# every time GitHub rotated the key; do not reintroduce it.
-#
-# Build (in-cluster, preferred — avoids pushing 2.9GB over the site uplink):
-#   oc start-build paperclip --from-dir=. --follow -n paperclip
-# Build (local, needs docker/podman):
-#   docker build -f Dockerfile.okd -t paperclip:v2026.722.0 .
+# Build in the cluster with the Paperclip BuildConfig. Pass the source commit
+# with PAPERCLIP_BUILD_COMMIT so the server and UI expose accurate build data.
 
-FROM node:lts-trixie-slim AS base
+FROM node:24-trixie-slim AS base
 RUN apt-get update \
   && apt-get install -y --no-install-recommends \
-       ca-certificates curl gh git wget ripgrep python3 openssh-client jq \
+       ca-certificates curl gh git wget ripgrep python3 tini openssh-client jq \
   && rm -rf /var/lib/apt/lists/* \
   && corepack enable
 
-# ── Dependency install ────────────────────────────────────────────────────────
-# Every workspace member listed in pnpm-workspace.yaml is copied before the
-# install so the layer caches on manifest changes only. sandbox-providers and
-# plugin-orchestration-smoke-example are excluded from the workspace globs but
-# are copied anyway — harmless, and it keeps this list mechanically derivable
-# from `git ls-tree`, so regenerating it after an upstream bump is trivial.
 FROM base AS deps
 WORKDIR /app
 COPY package.json pnpm-workspace.yaml pnpm-lock.yaml .npmrc ./
 COPY cli/package.json cli/
 COPY server/package.json server/
 COPY ui/package.json ui/
-COPY packages/adapter-utils/package.json packages/adapter-utils/
+COPY packages/shared/package.json packages/shared/
 COPY packages/db/package.json packages/db/
+COPY packages/adapter-utils/package.json packages/adapter-utils/
 COPY packages/google-sheets-mcp-server/package.json packages/google-sheets-mcp-server/
 COPY packages/kv-demo-mcp-server/package.json packages/kv-demo-mcp-server/
 COPY packages/mcp-server/package.json packages/mcp-server/
-COPY packages/shared/package.json packages/shared/
+COPY packages/paperclip-eval-kernel/package.json packages/paperclip-eval-kernel/
+COPY packages/paperclip-runner/package.json packages/paperclip-runner/
 COPY packages/skills-catalog/package.json packages/skills-catalog/
+COPY packages/tailscale-https-broker/package.json packages/tailscale-https-broker/
 COPY packages/teams-catalog/package.json packages/teams-catalog/
 COPY packages/adapters/claude-local/package.json packages/adapters/claude-local/
 COPY packages/adapters/codex-local/package.json packages/adapters/codex-local/
@@ -61,6 +44,7 @@ COPY packages/adapters/cursor-cloud/package.json packages/adapters/cursor-cloud/
 COPY packages/adapters/cursor-local/package.json packages/adapters/cursor-local/
 COPY packages/adapters/gemini-local/package.json packages/adapters/gemini-local/
 COPY packages/adapters/grok-local/package.json packages/adapters/grok-local/
+COPY packages/adapters/kimi-local/package.json packages/adapters/kimi-local/
 COPY packages/adapters/hermes/package.json packages/adapters/hermes/
 COPY packages/adapters/hermes-gateway/package.json packages/adapters/hermes-gateway/
 COPY packages/adapters/openclaw-gateway/package.json packages/adapters/openclaw-gateway/
@@ -77,6 +61,8 @@ COPY packages/plugins/examples/plugin-hello-world-example/package.json packages/
 COPY packages/plugins/examples/plugin-kitchen-sink-example/package.json packages/plugins/examples/plugin-kitchen-sink-example/
 COPY packages/plugins/examples/plugin-orchestration-smoke-example/package.json packages/plugins/examples/plugin-orchestration-smoke-example/
 COPY packages/plugins/sandbox-providers/cloudflare/package.json packages/plugins/sandbox-providers/cloudflare/
+COPY packages/plugins/sandbox-providers/cloudflare/bridge-template/package.json packages/plugins/sandbox-providers/cloudflare/bridge-template/
+COPY packages/plugins/sandbox-providers/createos/package.json packages/plugins/sandbox-providers/createos/
 COPY packages/plugins/sandbox-providers/daytona/package.json packages/plugins/sandbox-providers/daytona/
 COPY packages/plugins/sandbox-providers/e2b/package.json packages/plugins/sandbox-providers/e2b/
 COPY packages/plugins/sandbox-providers/exe-dev/package.json packages/plugins/sandbox-providers/exe-dev/
@@ -88,34 +74,90 @@ COPY scripts/link-plugin-dev-sdk.mjs scripts/
 
 RUN pnpm install --frozen-lockfile
 
-# ── Build ─────────────────────────────────────────────────────────────────────
-FROM base AS build
+FROM base AS rust-toolchain
+WORKDIR /app
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends gcc libc6-dev pkg-config \
+  && rm -rf /var/lib/apt/lists/*
+ENV RUSTUP_HOME=/usr/local/rustup \
+    CARGO_HOME=/usr/local/cargo \
+    PATH=/usr/local/cargo/bin:$PATH
+ARG RUSTUP_VERSION=1.29.0
+ARG RUSTUP_SHA256_AMD64=4acc9acc76d5079515b46346a485974457b5a79893cfb01112423c89aeb5aa10
+ARG RUSTUP_SHA256_ARM64=9732d6c5e2a098d3521fca8145d826ae0aaa067ef2385ead08e6feac88fa5792
+RUN set -eux; \
+    arch="$(dpkg --print-architecture)"; \
+    case "$arch" in \
+      amd64) rustTarget="x86_64-unknown-linux-gnu"; sha256="$RUSTUP_SHA256_AMD64" ;; \
+      arm64) rustTarget="aarch64-unknown-linux-gnu"; sha256="$RUSTUP_SHA256_ARM64" ;; \
+      *) echo "unsupported architecture: $arch" >&2; exit 1 ;; \
+    esac; \
+    curl -fsSLo /tmp/rustup-init "https://static.rust-lang.org/rustup/archive/${RUSTUP_VERSION}/${rustTarget}/rustup-init"; \
+    echo "${sha256}  /tmp/rustup-init" | sha256sum -c -; \
+    chmod +x /tmp/rustup-init; \
+    /tmp/rustup-init -y --no-modify-path --profile minimal --default-toolchain none; \
+    rm /tmp/rustup-init
+COPY packages/paperclip-runner/rust-toolchain.toml /tmp/runner-toolchain/rust-toolchain.toml
+RUN cd /tmp/runner-toolchain && rustup show
+
+FROM rust-toolchain AS rust-chef
+RUN cd /tmp/runner-toolchain && cargo install cargo-chef --version 0.1.73 --locked
+
+FROM rust-chef AS runner-plan
+WORKDIR /app/packages/paperclip-runner
+COPY packages/paperclip-runner/rust-toolchain.toml ./
+COPY packages/paperclip-runner/runner ./runner
+RUN cd runner && cargo chef prepare --recipe-path /tmp/runner-recipe.json
+
+FROM rust-chef AS runner-deps
+WORKDIR /app/packages/paperclip-runner/runner
+COPY packages/paperclip-runner/rust-toolchain.toml ../
+COPY --from=runner-plan /tmp/runner-recipe.json /tmp/runner-recipe.json
+RUN cargo chef cook --release --locked --package paperclip-runner-core --bin paperclip-runnerd --recipe-path /tmp/runner-recipe.json \
+  && find . -mindepth 1 -maxdepth 1 ! -name target -exec rm -rf {} +
+
+FROM runner-deps AS runner-build
+WORKDIR /app/packages/paperclip-runner
+COPY packages/paperclip-runner/rust-toolchain.toml ./
+COPY packages/paperclip-runner/runner ./runner
+COPY packages/paperclip-runner/protocol ./protocol
+RUN find runner protocol -type f -exec touch -d @0 {} + \
+  && touch -d @0 rust-toolchain.toml \
+  && cargo build --release --manifest-path runner/Cargo.toml --locked -p paperclip-runner-core --bin paperclip-runnerd
+
+FROM runner-build AS build
 WORKDIR /app
 COPY --from=deps /app /app
 COPY . .
+RUN find packages/paperclip-runner/runner packages/paperclip-runner/protocol -type f -exec touch -d @0 {} + \
+  && touch -d @0 packages/paperclip-runner/rust-toolchain.toml
+ARG PAPERCLIP_BUILD_COMMIT=""
 RUN pnpm --filter @paperclipai/ui build
 RUN pnpm --filter @paperclipai/plugin-sdk build
+ENV NODE_OPTIONS=--max-old-space-size=4096
 RUN pnpm --filter @paperclipai/server build
 RUN test -f server/dist/index.js || (echo "ERROR: server build output missing" && exit 1)
+RUN rm -rf packages/paperclip-runner/runner/target
 
-# ── Production ────────────────────────────────────────────────────────────────
 FROM base AS production
+ARG CLI_TOOLS_CACHE_EPOCH=""
 WORKDIR /app
-COPY --from=build /app /app
-
-RUN npm install --global --omit=dev \
-      @anthropic-ai/claude-code@latest \
-      @openai/codex@latest \
-      opencode-ai \
-      @google/gemini-cli@latest \
+RUN echo "cli-tools-epoch: ${CLI_TOOLS_CACHE_EPOCH}" \
+  && npm install --global --omit=dev \
+       @anthropic-ai/claude-code@latest \
+       @openai/codex@latest \
+       opencode-ai \
+       @google/gemini-cli@latest \
+       @moonshot-ai/kimi-code@latest \
   && mkdir -p /paperclip \
   && chown 1001:0 /paperclip \
   && chmod 775 /paperclip
 
-# restricted-v2 SCC: the container runs as an arbitrary UID that is always a
-# member of GID 0. Every path the app writes to must be group-writable.
+COPY --chown=1001:0 --from=build /app /app
 RUN chmod -R g=u /paperclip /app
 
+ARG PAPERCLIP_BUILD_VERSION=""
+ARG PAPERCLIP_BUILD_COMMIT=""
 ENV NODE_ENV=production \
   HOME=/paperclip \
   HOST=0.0.0.0 \
@@ -123,6 +165,8 @@ ENV NODE_ENV=production \
   SERVE_UI=true \
   PAPERCLIP_HOME=/paperclip \
   PAPERCLIP_INSTANCE_ID=default \
+  PAPERCLIP_BUILD_VERSION=${PAPERCLIP_BUILD_VERSION} \
+  PAPERCLIP_BUILD_COMMIT=${PAPERCLIP_BUILD_COMMIT} \
   PAPERCLIP_CONFIG=/paperclip/instances/default/config.json \
   PAPERCLIP_DEPLOYMENT_MODE=authenticated \
   PAPERCLIP_DEPLOYMENT_EXPOSURE=private \
@@ -131,10 +175,6 @@ ENV NODE_ENV=production \
 
 EXPOSE 3100
 
-# OKD overrides this with an arbitrary UID from the namespace range; setting it
-# keeps the image runnable as non-root outside OKD too. No ENTRYPOINT: upstream's
-# docker-entrypoint.sh only exists to gosu-switch users, which we cannot and
-# need not do here.
 USER 1001
-
+ENTRYPOINT ["/usr/bin/tini", "--"]
 CMD ["node", "--import", "./server/node_modules/tsx/dist/loader.mjs", "server/dist/index.js"]

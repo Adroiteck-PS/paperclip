@@ -41,6 +41,17 @@ Low-trust agents cannot read or mutate agent configuration, instruction bundles,
 or company skill configuration through direct grants. Configuration changes from
 low-trust work must go through higher-trust review and promotion paths instead.
 
+## Child→Parent Reporting Under Containment
+
+The direct-parent report comment (`doc/execution-semantics.md` §6, "Child→Parent
+Reporting") is **off by default** for `low_trust_review`: a contained run reads
+untrusted input, so a free-prose comment into the higher-trust parent thread is
+a prompt-injection promotion path. Contained reviewers report by completing
+their own review issue (`done` — the verdict is the deliverable; the
+`issue_blockers_resolved` wake carries it upward) and by the platform's
+system-attributed stop-only relay when they enter `blocked` or `cancelled`.
+Never instruct a contained delegate to comment on its parent issue.
+
 ## Runtime Containment
 
 Managed `low_trust_review` runs fail closed unless Paperclip can enforce the
@@ -53,6 +64,13 @@ runtime boundary:
 - inline sensitive environment values such as API keys and tokens are rejected
 - workspace runtime-service mutations are denied unless the boundary explicitly
   grants the `runtime.manage` tool class
+
+When the task's project has no configured workspace and no layer specifies a
+workspace strategy, sandbox execution uses a private directory for that company
+and task. The directory persists across turns and reassignment and never imports the shared
+project directory or agent home. No Git repository is required for this case.
+Configured workspaces and explicit Git strategies keep their existing validation;
+a missing or broken checkout does not fall back to an empty directory.
 
 The Docker workflow in `doc/UNTRUSTED-PR-REVIEW.md` remains useful for manual
 local review, but Paperclip-managed low-trust execution requires a sandboxed
